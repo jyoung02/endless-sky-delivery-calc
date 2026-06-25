@@ -4,9 +4,9 @@ A small Python tool for [Endless Sky](https://endless-sky.github.io/) that reads
 
 ## What it does
 
-- Reads your current system, date, and drive type from the save file
+- Reads your current system, date, drive type, and current fuel from the save file
 - Finds all timed missions (`available job` blocks with deadlines)
-- Runs BFS on the star map to find the shortest hop count to each destination
+- Runs BFS on the star map tracking fuel state — refuels at inhabited systems along the route (no time cost)
 - Displays results in a small window with color-coded GO / TIGHT / NO-GO status
 
 ## Requirements
@@ -30,6 +30,13 @@ Save file and map path are auto-detected from standard locations. If auto-detect
 
 ## Results window
 
+The header shows your current system, date, drive type, and fuel:
+
+```
+Date: 22 Aug 3014   System: Rastaban   Drive: Hyperdrive
+Fuel: 300/300  (3 jumps now, 3 max)
+```
+
 Each timed mission is listed with hop count, days remaining until deadline, and margin:
 
 ```
@@ -46,11 +53,17 @@ Hops: 3  |  Days: 6  |  Margin: +3    ✓ GO
 - Red — NO-GO (deadline will be missed)
 - Gray — UNKNOWN (destination not found or route impossible)
 
+## Fuel modeling
+
+The routing accounts for fuel. Each jump costs 100 fuel. If your ship can't reach the destination without running dry, the BFS finds a route that stops at an inhabited system to refuel — landing is free time-wise, so only detours off the direct path cost extra hops.
+
+If no viable route exists within explored space (or at all), the mission shows as UNKNOWN.
+
 ## Explored systems toggle
 
-The **"Explored systems only"** checkbox is on by default. When checked, BFS is restricted to systems you've already visited — so the hop count reflects routes you can actually see on your map. If no route exists through explored space, the mission shows as "Route unknown (unexplored)".
+The **"Explored systems only"** checkbox is on by default. When checked, BFS is restricted to systems you've already visited — so the hop count reflects routes you can actually see on your map.
 
-Uncheck it to plan routes through unexplored systems and see the theoretical minimum hop count.
+Uncheck it to route through unexplored systems and see the theoretical minimum hop count.
 
 Toggling recalculates instantly — no restart needed.
 

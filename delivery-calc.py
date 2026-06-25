@@ -376,6 +376,7 @@ def build_ui(save_data: dict, graph: dict, planet_system: dict, inhabited: set[s
     root.title("Endless Sky — Delivery Calculator")
     root.configure(bg="#1e1e2e")
     root.resizable(False, False)
+    root.attributes("-topmost", True)
 
     # ── Header ───────────────────────────────────────────────────────────────
     hdr = tk.Frame(root, bg="#1e1e2e", pady=8)
@@ -499,4 +500,16 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import traceback, tempfile
+    try:
+        main()
+    except Exception:
+        log = Path(tempfile.gettempdir()) / "delivery-calc-error.txt"
+        log.write_text(traceback.format_exc())
+        # Also show a tkinter error dialog if possible
+        try:
+            import tkinter.messagebox as mb
+            root = tk.Tk(); root.withdraw()
+            mb.showerror("delivery-calc crashed", f"Error log: {log}\n\n{traceback.format_exc()}")
+        except Exception:
+            pass

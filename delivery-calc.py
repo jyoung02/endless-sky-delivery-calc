@@ -4,15 +4,42 @@ Reads the save file + star map, runs BFS, shows go/no-go for timed missions.
 """
 
 import argparse
+import os
 import re
 import tkinter as tk
 from collections import deque
 from datetime import date
+from pathlib import Path
 
 # ─── Defaults ───────────────────────────────────────────────────────────────
 
-DEFAULT_SAVE = r"C:\Users\Jason\AppData\Roaming\endless-sky\saves\Dawg Young.txt"
-DEFAULT_MAP  = r"C:\Program Files (x86)\Steam\steamapps\common\Endless Sky\data\map systems.txt"
+def _find_save() -> str | None:
+    """Return the most recently modified save file, ignoring backups."""
+    saves_dir = Path(os.environ.get("APPDATA", "")) / "endless-sky" / "saves"
+    if not saves_dir.is_dir():
+        return None
+    candidates = [
+        p for p in saves_dir.glob("*.txt")
+        if "previous" not in p.name and "~~" not in p.name
+    ]
+    if not candidates:
+        return None
+    return str(max(candidates, key=lambda p: p.stat().st_mtime))
+
+def _find_map() -> str | None:
+    """Return path to map systems.txt from the standard Steam install location."""
+    candidates = [
+        Path(r"C:\Program Files (x86)\Steam\steamapps\common\Endless Sky\data\map systems.txt"),
+        Path(r"C:\Program Files\Steam\steamapps\common\Endless Sky\data\map systems.txt"),
+        Path(os.environ.get("HOME", "")) / ".local/share/Steam/steamapps/common/Endless Sky/data/map systems.txt",
+    ]
+    for p in candidates:
+        if p.is_file():
+            return str(p)
+    return None
+
+DEFAULT_SAVE = _find_save()
+DEFAULT_MAP  = _find_map()
 
 # ─── Star-map parser ─────────────────────────────────────────────────────────
 
@@ -412,6 +439,11 @@ def main():
     parser.add_argument("--save", default=DEFAULT_SAVE, help="Path to save file")
     parser.add_argument("--map",  default=DEFAULT_MAP,  help="Path to map systems.txt")
     args = parser.parse_args()
+
+    if not args.map:
+        parser.error("Could not find map systems.txt. Use --map to specify its path.")
+    if not args.save:
+        parser.error("Could not find a save file. Use --save to specify its path.")
 
     print("Parsing star map…")
     graph, planet_system = parse_map(args.map)

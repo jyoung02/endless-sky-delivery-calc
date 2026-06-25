@@ -106,6 +106,7 @@ def parse_save(save_path: str) -> dict:
     result = {
         "current_date": None,
         "current_system": None,
+        "travel": None,
         "drive": "hyperdrive",
         "fuel": 100,
         "fuel_capacity": 100,
@@ -128,6 +129,9 @@ def parse_save(save_path: str) -> dict:
                 continue
             if m := re.match(r'^system\s+"?([^"]+)"?\s*$', line):
                 result["current_system"] = m.group(1)
+                continue
+            if m := re.match(r'^travel\s+"?([^"]+)"?\s*$', line):
+                result["travel"] = m.group(1)
                 continue
             if re.match(r'^ship\s+', line):
                 header_done = True
@@ -379,6 +383,7 @@ def build_ui(save_data: dict, graph: dict, planet_system: dict, inhabited: set[s
 
     date_str  = save_data["current_date"].strftime("%d %b %Y") if save_data["current_date"] else "?"
     sys_str   = save_data["current_system"] or "?"
+    travel    = save_data["travel"]
     drive_str = save_data["drive"].title()
     fuel      = save_data["fuel"]
     fuel_cap  = save_data["fuel_capacity"]
@@ -387,6 +392,9 @@ def build_ui(save_data: dict, graph: dict, planet_system: dict, inhabited: set[s
 
     tk.Label(hdr, text=f"Date: {date_str}   System: {sys_str}   Drive: {drive_str}",
              font=("Courier", 11), fg="#cdd6f4", bg="#1e1e2e").pack(anchor="w")
+    if travel:
+        tk.Label(hdr, text=f"In transit → {travel}",
+                 font=("Courier", 10), fg="#f39c12", bg="#1e1e2e").pack(anchor="w")
     tk.Label(hdr, text=f"Fuel: {fuel}/{fuel_cap}  ({jumps_now} jumps now, {jumps_max} max)",
              font=("Courier", 10), fg="#a6adc8", bg="#1e1e2e").pack(anchor="w")
 

@@ -48,16 +48,20 @@ FUEL_PER_JUMP = 100
 # ─── Snapshot (UUID diff) ────────────────────────────────────────────────────
 
 def load_snapshot() -> dict:
-    """Return snapshot dict with location and UUIDs, or empty dict."""
+    """Return snapshot dict, or empty dict on failure."""
     try:
         return json.loads(SNAPSHOT_FILE.read_text())
     except Exception:
         return {}
 
 def save_snapshot(missions: list[dict], system: str, planet: str | None) -> None:
-    """Save current location and job UUIDs for diffing on next run."""
+    """Save per-location UUID history and last-run location."""
+    snapshot = load_snapshot()
+    key = f"{system}::{planet}"
     uuids = [m["uuid"] for m in missions if m.get("uuid")]
-    SNAPSHOT_FILE.write_text(json.dumps({"system": system, "planet": planet, "uuids": uuids}))
+    snapshot[key] = uuids
+    snapshot["_last"] = key
+    SNAPSHOT_FILE.write_text(json.dumps(snapshot))
 
 # ─── Star-map parser ─────────────────────────────────────────────────────────
 
@@ -550,11 +554,15 @@ def main():
     print(f"  Timed missions: {len(save_data['missions'])}")
     print(f"  Visited systems: {len(save_data['visited'])}")
 
-    snapshot   = load_snapshot()
-    same_loc   = (snapshot.get("system") == save_data["current_system"] and
-                  snapshot.get("planet") == save_data["current_planet"])
-    prev_uuids = set() if same_loc else set(snapshot.get("uuids", []))
-    print(f"  Same location as last run: {same_loc} — {'showing all' if same_loc else 'diffing'}")
+    snapshot    = load_snapshot()
+    current_key = f"{save_data['current_system']}::{save_data['current_planet']}"
+    last_key    = snapshot.get("_last")
+    same_loc    = (last_key == current_key)
+    if same_loc:
+        prev_uuids = set()          # re-run at same spot → show everything
+    else:
+        prev_uuids = set(snapshot.get(current_key, []))  # diff vs last visit HERE
+    print(f"  Last run: {last_key or 'none'}  Now: {current_key}  same={same_loc}")
     save_snapshot(save_data["missions"], save_data["current_system"], save_data["current_planet"])
 
     build_ui(save_data, graph, planet_system, inhabited, prev_uuids)

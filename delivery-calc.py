@@ -165,8 +165,11 @@ def parse_save(save_path: str) -> dict:
                 if result["travel"] is None:
                     result["travel"] = m.group(1)
                 continue
-            if re.match(r'^ship\s+', line):
+                if re.match(r'^ship\s+', line):
                 header_done = True
+
+        if m := re.match(r'^visited\s+"?([^"]+)"?\s*$', line):
+            result["visited"].add(m.group(1))
 
     # ES saves the departure date, not arrival — each jump costs 1 day.
     # If "system entry method" is set, the player arrived via hyperspace and
@@ -174,9 +177,6 @@ def parse_save(save_path: str) -> dict:
     if raw_date is not None:
         offset = 1 if system_entry_method is not None else 0
         result["current_date"] = raw_date + timedelta(days=offset)
-
-        if m := re.match(r'^visited\s+"?([^"]+)"?\s*$', line):
-            result["visited"].add(m.group(1))
 
     # ── Pass 2: flagship fuel, fuel_capacity, drive ──────────────────────────
     flagship_found = False

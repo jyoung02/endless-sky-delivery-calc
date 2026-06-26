@@ -4,6 +4,7 @@ Reads the save file + star map, runs BFS with fuel state, shows go/no-go for tim
 """
 
 import argparse
+import json
 import os
 import re
 import tkinter as tk
@@ -38,10 +39,26 @@ def _find_map() -> str | None:
             return str(p)
     return None
 
-DEFAULT_SAVE = _find_save()
-DEFAULT_MAP  = _find_map()
+DEFAULT_SAVE  = _find_save()
+DEFAULT_MAP   = _find_map()
+SNAPSHOT_FILE = Path(__file__).parent / ".delivery-calc-snapshot.json"
 
 FUEL_PER_JUMP = 100
+
+# ─── Snapshot (UUID diff) ────────────────────────────────────────────────────
+
+def load_snapshot() -> set[str]:
+    """Return set of job UUIDs from last run, or empty set."""
+    try:
+        data = json.loads(SNAPSHOT_FILE.read_text())
+        return set(data.get("uuids", []))
+    except Exception:
+        return set()
+
+def save_snapshot(missions: list[dict]) -> None:
+    """Save current job UUIDs for diffing on next run."""
+    uuids = [m["uuid"] for m in missions if m.get("uuid")]
+    SNAPSHOT_FILE.write_text(json.dumps({"uuids": uuids}))
 
 # ─── Star-map parser ─────────────────────────────────────────────────────────
 
@@ -106,6 +123,7 @@ def parse_save(save_path: str) -> dict:
     result = {
         "current_date": None,
         "current_system": None,
+        "current_planet": None,
         "travel": None,
         "drive": "hyperdrive",
         "fuel": 100,
@@ -130,8 +148,13 @@ def parse_save(save_path: str) -> dict:
             if m := re.match(r'^system\s+"?([^"]+)"?\s*$', line):
                 result["current_system"] = m.group(1)
                 continue
+            if m := re.match(r'^planet\s+"?([^"]+)"?\s*$', line):
+                result["current_planet"] = m.group(1)
+                continue
             if m := re.match(r'^travel\s+"?([^"]+)"?\s*$', line):
-                result["travel"] = m.group(1)
+                # Only record the first travel entry; multiple = autopilot route not mid-jump
+                if result["travel"] is None:
+                    result["travel"] = m.group(1)
                 continue
             if re.match(r'^ship\s+', line):
                 header_done = True
@@ -197,7 +220,7 @@ def parse_save(save_path: str) -> dict:
             if in_mission and mission.get("deadline") and mission.get("destination"):
                 result["missions"].append(mission)
             in_mission = True
-            mission = {"name": m.group(1), "deadline": None, "destination": None}
+            mission = {"name": m.group(1), "deadline": None, "destination": None, "uuid": None}
             continue
 
         if not in_mission:
@@ -208,6 +231,10 @@ def parse_save(save_path: str) -> dict:
                 result["missions"].append(mission)
             in_mission = False
             mission = {}
+            continue
+
+        if m := re.match(r'^\tuuid\s+(\S+)\s*$', line):
+            mission["uuid"] = m.group(1)
             continue
 
         if m := re.match(r'^\tname\s+"?([^"]+)"?\s*$', line):
@@ -371,7 +398,8 @@ STATUS_SYMBOLS = {
 }
 
 
-def build_ui(save_data: dict, graph: dict, planet_system: dict, inhabited: set[str]) -> None:
+def build_ui(save_data: dict, graph: dict, planet_system: dict, inhabited: set[str],
+             prev_uuids: set[str]) -> None:
     root = tk.Tk()
     root.title("Endless Sky — Delivery Calculator")
     root.configure(bg="#1e1e2e")
@@ -382,22 +410,38 @@ def build_ui(save_data: dict, graph: dict, planet_system: dict, inhabited: set[s
     hdr = tk.Frame(root, bg="#1e1e2e", pady=8)
     hdr.pack(fill="x", padx=16)
 
-    date_str  = save_data["current_date"].strftime("%d %b %Y") if save_data["current_date"] else "?"
-    sys_str   = save_data["current_system"] or "?"
-    travel    = save_data["travel"]
-    drive_str = save_data["drive"].title()
-    fuel      = save_data["fuel"]
-    fuel_cap  = save_data["fuel_capacity"]
-    jumps_now = fuel // FUEL_PER_JUMP
-    jumps_max = fuel_cap // FUEL_PER_JUMP
+    date_str    = save_data["current_date"].strftime("%d %b %Y") if save_data["current_date"] else "?"
+    sys_str     = save_data["current_system"] or "?"
+    planet      = save_data["current_planet"]
+    travel      = save_data["travel"]
+    in_transit  = travel is not None and planet is None
+    drive_str   = save_data["drive"].title()
+    fuel        = save_data["fuel"]
+    fuel_cap    = save_data["fuel_capacity"]
+    jumps_now   = fuel // FUEL_PER_JUMP
+    jumps_max   = fuel_cap // FUEL_PER_JUMP
 
-    tk.Label(hdr, text=f"Date: {date_str}   System: {sys_str}   Drive: {drive_str}",
+    location_str = f"System: {sys_str}" + (f"   Planet: {planet}" if planet else "")
+    tk.Label(hdr, text=f"Date: {date_str}   {location_str}   Drive: {drive_str}",
              font=("Courier", 11), fg="#cdd6f4", bg="#1e1e2e").pack(anchor="w")
-    if travel:
+    if in_transit:
         tk.Label(hdr, text=f"In transit → {travel}",
                  font=("Courier", 10), fg="#f39c12", bg="#1e1e2e").pack(anchor="w")
     tk.Label(hdr, text=f"Fuel: {fuel}/{fuel_cap}  ({jumps_now} jumps now, {jumps_max} max)",
              font=("Courier", 10), fg="#a6adc8", bg="#1e1e2e").pack(anchor="w")
+
+    # Filter missions: if we have a previous snapshot, only show new UUIDs
+    all_missions  = save_data["missions"]
+    is_new_board  = bool(prev_uuids)
+    if is_new_board:
+        missions = [m for m in all_missions if m.get("uuid") not in prev_uuids]
+        hidden   = len(all_missions) - len(missions)
+    else:
+        missions  = all_missions
+        hidden    = 0
+
+    # Override save_data missions for calc_results
+    filtered_save = {**save_data, "missions": missions}
 
     # ── Toggle ───────────────────────────────────────────────────────────────
     visited_var = tk.BooleanVar(value=True)
@@ -418,14 +462,24 @@ def build_ui(save_data: dict, graph: dict, planet_system: dict, inhabited: set[s
     results_frame = tk.Frame(root, bg="#1e1e2e")
     results_frame.pack(fill="both", expand=True, padx=16, pady=(0, 8))
 
+    if hidden:
+        tk.Label(results_frame,
+                 text=f"{hidden} job(s) from previous landings hidden",
+                 font=("Courier", 9), fg="#6c7086", bg="#1e1e2e").pack(anchor="w", pady=(0, 4))
+
     def refresh():
         for widget in results_frame.winfo_children():
             widget.destroy()
 
-        results = calc_results(save_data, graph, planet_system, inhabited, visited_var.get())
+        if hidden:
+            tk.Label(results_frame,
+                     text=f"{hidden} job(s) from previous landings hidden",
+                     font=("Courier", 9), fg="#6c7086", bg="#1e1e2e").pack(anchor="w", pady=(0, 4))
+
+        results = calc_results(filtered_save, graph, planet_system, inhabited, visited_var.get())
 
         if not results:
-            tk.Label(results_frame, text="No timed missions found.",
+            tk.Label(results_frame, text="No new timed missions at this location.",
                      font=("Courier", 11), fg="#6c7086", bg="#1e1e2e").pack(pady=8)
             return
 
@@ -491,12 +545,17 @@ def main():
     fuel_cap = save_data["fuel_capacity"]
     print(f"  Date: {save_data['current_date']}")
     print(f"  System: {save_data['current_system']}")
+    print(f"  Planet: {save_data['current_planet']}")
     print(f"  Drive: {save_data['drive']}")
     print(f"  Fuel: {fuel}/{fuel_cap} ({fuel // FUEL_PER_JUMP} jumps now, {fuel_cap // FUEL_PER_JUMP} max)")
     print(f"  Timed missions: {len(save_data['missions'])}")
     print(f"  Visited systems: {len(save_data['visited'])}")
 
-    build_ui(save_data, graph, planet_system, inhabited)
+    prev_uuids = load_snapshot()
+    print(f"  Previous snapshot: {len(prev_uuids)} UUIDs")
+    save_snapshot(save_data["missions"])
+
+    build_ui(save_data, graph, planet_system, inhabited, prev_uuids)
 
 
 if __name__ == "__main__":

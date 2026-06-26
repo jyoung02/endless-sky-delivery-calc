@@ -4,6 +4,7 @@ Reads the save file + star map, runs BFS with fuel state, shows go/no-go for tim
 """
 
 import argparse
+import glob
 import json
 import os
 import re
@@ -39,8 +40,46 @@ def _find_map() -> str | None:
             return str(p)
     return None
 
-DEFAULT_SAVE  = _find_save()
-DEFAULT_MAP   = _find_map()
+def _find_data_dir() -> str | None:
+    """Return path to the Endless Sky data directory."""
+    candidates = [
+        Path(r"C:\Program Files (x86)\Steam\steamapps\common\Endless Sky\data"),
+        Path(r"C:\Program Files\Steam\steamapps\common\Endless Sky\data"),
+        Path(os.environ.get("HOME", "")) / ".local/share/Steam/steamapps/common/Endless Sky/data",
+    ]
+    for p in candidates:
+        if p.is_dir():
+            return str(p)
+    return None
+
+def parse_job_templates(data_dir: str) -> dict[str, tuple[int, int]]:
+    """
+    Parse mission data files to build a map of template name → (min_dist, max_dist).
+    Only includes missions with both a deadline and a destination distance range.
+    """
+    templates: dict[str, tuple[int, int]] = {}
+    for filepath in glob.glob(f"{data_dir}/**/*.txt", recursive=True):
+        try:
+            text = open(filepath, encoding="utf-8").read()
+        except Exception:
+            continue
+        blocks = re.split(r"(?=^mission\s)", text, flags=re.MULTILINE)
+        for block in blocks:
+            m = re.match(r'^mission\s+"([^"]+)"', block)
+            if not m or "deadline" not in block:
+                continue
+            name = m.group(1)
+            dm = re.search(
+                r"^\tdestination\s*\n(?:[^\n]*\n)*?[^\n]*distance\s+(\d+)\s+(\d+)",
+                block, re.MULTILINE,
+            )
+            if dm:
+                templates[name] = (int(dm.group(1)), int(dm.group(2)))
+    return templates
+
+DEFAULT_SAVE     = _find_save()
+DEFAULT_MAP      = _find_map()
+DEFAULT_DATA_DIR = _find_data_dir()
 SNAPSHOT_FILE = Path(__file__).parent / ".delivery-calc-snapshot.json"
 
 FUEL_PER_JUMP = 100
@@ -232,11 +271,11 @@ def parse_save(save_path: str) -> dict:
         stripped = line.lstrip()
         indent = len(line) - len(stripped)
 
-        if m := re.match(r'^"available job"\s+"?([^"]+)"?\s*$', line):
+        if m := re.match(r'^"available job"\s+"([^"]+)"\s*$', line):
             if in_mission and mission.get("deadline") and mission.get("destination"):
                 result["missions"].append(mission)
             in_mission = True
-            mission = {"name": m.group(1), "deadline": None, "destination": None, "uuid": None}
+            mission = {"name": m.group(1), "template": m.group(1), "deadline": None, "destination": None, "uuid": None}
             continue
 
         if not in_mission:
@@ -335,6 +374,7 @@ def calc_results(
     planet_system: dict[str, str],
     inhabited: set[str],
     visited_only: bool = False,
+    job_templates: dict[str, tuple[int, int]] | None = None,
 ) -> list[dict]:
     """
     Returns list of result dicts:
@@ -364,6 +404,22 @@ def calc_results(
                 "status": "UNKNOWN",
             })
             continue
+
+        # Use full graph for distance-filter (template range is game-world distance)
+        true_hops = shortest_hops(
+            graph, current_sys, dest_system,
+            fuel, fuel_cap, inhabited,
+            visited_only=False, visited=None,
+        )
+
+        # Filter: if destination distance is outside the template's valid range,
+        # this job was offered at a different planet — skip it.
+        if job_templates and true_hops is not None:
+            template = m.get("template", "")
+            if template in job_templates:
+                lo, hi = job_templates[template]
+                if not (lo <= true_hops <= hi):
+                    continue
 
         hops = shortest_hops(
             graph, current_sys, dest_system,
@@ -415,7 +471,7 @@ STATUS_SYMBOLS = {
 
 
 def build_ui(save_data: dict, graph: dict, planet_system: dict, inhabited: set[str],
-             prev_uuids: set[str]) -> None:
+             prev_uuids: set[str], job_templates: dict | None = None) -> None:
     root = tk.Tk()
     root.title("Endless Sky — Delivery Calculator")
     root.configure(bg="#1e1e2e")
@@ -493,7 +549,7 @@ def build_ui(save_data: dict, graph: dict, planet_system: dict, inhabited: set[s
         if hidden:
             txt.insert("end", f"{hidden} job(s) already seen (hidden)\n\n", "dim")
 
-        results = calc_results(filtered_save, graph, planet_system, inhabited, visited_var.get())
+        results = calc_results(filtered_save, graph, planet_system, inhabited, visited_var.get(), job_templates)
 
         if not results:
             txt.insert("end", "No new timed missions at this location.", "dim")
@@ -527,14 +583,21 @@ def build_ui(save_data: dict, graph: dict, planet_system: dict, inhabited: set[s
 
 def main():
     parser = argparse.ArgumentParser(description="Endless Sky delivery deadline calculator")
-    parser.add_argument("--save", default=DEFAULT_SAVE, help="Path to save file")
-    parser.add_argument("--map",  default=DEFAULT_MAP,  help="Path to map systems.txt")
+    parser.add_argument("--save", default=DEFAULT_SAVE,     help="Path to save file")
+    parser.add_argument("--map",  default=DEFAULT_MAP,      help="Path to map systems.txt")
+    parser.add_argument("--data", default=DEFAULT_DATA_DIR, help="Path to Endless Sky data directory")
     args = parser.parse_args()
 
     if not args.map:
         parser.error("Could not find map systems.txt. Use --map to specify its path.")
     if not args.save:
         parser.error("Could not find a save file. Use --save to specify its path.")
+
+    job_templates: dict[str, tuple[int, int]] = {}
+    if args.data:
+        print("Parsing job templates…")
+        job_templates = parse_job_templates(args.data)
+        print(f"  {len(job_templates)} timed mission templates loaded")
 
     print("Parsing star map…")
     graph, planet_system = parse_map(args.map)
@@ -551,6 +614,8 @@ def main():
     print(f"  Drive: {save_data['drive']}")
     print(f"  Fuel: {fuel}/{fuel_cap} ({fuel // FUEL_PER_JUMP} jumps now, {fuel_cap // FUEL_PER_JUMP} max)")
     print(f"  Timed missions: {len(save_data['missions'])}")
+    for m in save_data["missions"]:
+        print(f"    {m['name']} -> {m['destination']} (deadline {m['deadline']})")
     print(f"  Visited systems: {len(save_data['visited'])}")
 
     snapshot    = load_snapshot()
@@ -559,7 +624,7 @@ def main():
     print(f"  Known UUIDs at this location: {len(prev_uuids)}")
     save_snapshot(save_data["missions"], save_data["current_system"], save_data["current_planet"])
 
-    build_ui(save_data, graph, planet_system, inhabited, prev_uuids)
+    build_ui(save_data, graph, planet_system, inhabited, prev_uuids, job_templates)
 
 
 if __name__ == "__main__":

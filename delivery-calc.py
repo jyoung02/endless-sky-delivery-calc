@@ -165,7 +165,7 @@ def parse_save(save_path: str) -> dict:
                 if result["travel"] is None:
                     result["travel"] = m.group(1)
                 continue
-                if re.match(r'^ship\s+', line):
+            if re.match(r'^ship\s+', line):
                 header_done = True
 
         if m := re.match(r'^visited\s+"?([^"]+)"?\s*$', line):

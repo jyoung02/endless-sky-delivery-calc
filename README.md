@@ -4,8 +4,8 @@ A small Python tool for [Endless Sky](https://endless-sky.github.io/) that reads
 
 ## What it does
 
-- Reads your current system, date, drive type, and current fuel from the save file
-- Finds all timed missions (`available job` blocks with deadlines)
+- Reads your current system, planet, date, drive type, and current fuel from the save file
+- Finds timed missions at the current spaceport (filters out jobs from previous landings)
 - Runs BFS on the star map tracking fuel state — refuels at inhabited systems along the route (no time cost)
 - Displays results in a small window with color-coded GO / TIGHT / NO-GO status
 
@@ -28,6 +28,17 @@ Save file and map path are auto-detected from standard locations. If auto-detect
 --map   PATH   Path to "map systems.txt" in the Endless Sky data folder
 ```
 
+## Workflow
+
+The tool tracks job UUIDs between runs to filter out stale jobs from previous spaceports:
+
+1. **Land at a planet, save the game** (`Ctrl+S`)
+2. **Run the tool** — saves a snapshot of current job UUIDs, shows all timed jobs
+3. **Depart, travel, land somewhere new, save again**
+4. **Run the tool** — shows only new jobs from this landing; old ones are hidden with a count at the top
+
+To reset the snapshot and see all jobs again, delete `.delivery-calc-snapshot.json` from the tool's folder.
+
 ## Bind to a hotkey (Windows)
 
 So you can pop it up without leaving the game:
@@ -39,26 +50,33 @@ So you can pop it up without leaving the game:
 2. Right-click the shortcut → Properties → **Shortcut key** → press your combo (e.g. `Ctrl+Alt+D`)
 3. Move the shortcut somewhere permanent — the hotkey stops working if the shortcut is deleted or moved
 
-The window will pop up on top of the game. Use `pythonw.exe` (not `python.exe`) so no console window appears.
+> **Note:** Windows shortcut hotkeys don't work while a fullscreen game has focus. Use AutoHotkey instead — see `delivery-calc.ahk` for a ready-made script.
+
+The window appears on top of the game. Use `pythonw.exe` (not `python.exe`) so no console window appears.
 
 ## Results window
 
-The header shows your current system, date, drive type, and fuel. If you saved mid-jump, it shows where you're headed:
+The header shows your current location, date, drive type, and fuel:
 
 ```
-Date: 22 Aug 3014   System: Rastaban   Drive: Hyperdrive
-In transit → Girtab
+Date: 24 Aug 3014   System: Girtab   Planet: Harmony   Drive: Hyperdrive
 Fuel: 300/300  (3 jumps now, 3 max)
+```
+
+If you saved while in hyperspace (no planet set), it shows where you're headed:
+
+```
+In transit → Markab
 ```
 
 Each timed mission is listed with hop count, days remaining until deadline, and margin:
 
 ```
-Disaster relief to New India → New India (Albaldah)
-Hops: 2  |  Days: 4  |  Margin: +2    ✓ GO
+Large rush delivery to Hephaestus → Hephaestus (Markab)
+Hops: 4  |  Days: 18  |  Margin: +14    ✓ GO
 
-Rush delivery to Arabia → Arabia (Ascella)
-Hops: 3  |  Days: 6  |  Margin: +3    ✓ GO
+Rush delivery to Dancer → Dancer (Rastaban)
+Hops: 1  |  Days: 2   |  Margin: +1     ⚠ TIGHT
 ```
 
 **Status colors:**
@@ -70,12 +88,6 @@ Hops: 3  |  Days: 6  |  Margin: +3    ✓ GO
 ## Fuel modeling
 
 The routing accounts for fuel. Each jump costs 100 fuel. If your ship can't reach the destination without running dry, the BFS finds a route that stops at an inhabited system to refuel — landing is free time-wise, so only detours off the direct path cost extra hops.
-
-If no viable route exists within explored space (or at all), the mission shows as UNKNOWN.
-
-## Mid-jump behavior
-
-If you save while in hyperspace, the tool starts routing from your last system (not your destination). The in-progress jump counts as hop 1 in the BFS, so hop count and margin are still correct. The header shows "In transit → [destination]" so you know it's accounted for.
 
 ## Explored systems toggle
 

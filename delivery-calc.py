@@ -5,7 +5,6 @@ Reads the save file + star map, runs BFS with fuel state, shows go/no-go for tim
 
 import argparse
 import glob
-import json
 import os
 import re
 import tkinter as tk
@@ -80,27 +79,7 @@ def parse_job_templates(data_dir: str) -> dict[str, tuple[int, int]]:
 DEFAULT_SAVE     = _find_save()
 DEFAULT_MAP      = _find_map()
 DEFAULT_DATA_DIR = _find_data_dir()
-SNAPSHOT_FILE = Path(__file__).parent / ".delivery-calc-snapshot.json"
-
 FUEL_PER_JUMP = 100
-
-# ─── Snapshot (UUID diff) ────────────────────────────────────────────────────
-
-def load_snapshot() -> dict:
-    """Return snapshot dict, or empty dict on failure."""
-    try:
-        return json.loads(SNAPSHOT_FILE.read_text())
-    except Exception:
-        return {}
-
-def save_snapshot(missions: list[dict], system: str, planet: str | None) -> None:
-    """Add current job UUIDs to the seen-set for this location (never clears old ones)."""
-    snapshot = load_snapshot()
-    key = f"{system}::{planet}"
-    existing = set(snapshot.get(key, []))
-    current  = {m["uuid"] for m in missions if m.get("uuid")}
-    snapshot[key] = list(existing | current)
-    SNAPSHOT_FILE.write_text(json.dumps(snapshot))
 
 # ─── Star-map parser ─────────────────────────────────────────────────────────
 
@@ -471,7 +450,7 @@ STATUS_SYMBOLS = {
 
 
 def build_ui(save_data: dict, graph: dict, planet_system: dict, inhabited: set[str],
-             prev_uuids: set[str], job_templates: dict | None = None) -> None:
+             job_templates: dict | None = None) -> None:
     root = tk.Tk()
     root.title("Endless Sky — Delivery Calculator")
     root.configure(bg="#1e1e2e")
@@ -502,18 +481,7 @@ def build_ui(save_data: dict, graph: dict, planet_system: dict, inhabited: set[s
     tk.Label(hdr, text=f"Fuel: {fuel}/{fuel_cap}  ({jumps_now} jumps now, {jumps_max} max)",
              font=("Courier", 10), fg="#a6adc8", bg="#1e1e2e").pack(anchor="w")
 
-    # Filter missions: if we have a previous snapshot, only show new UUIDs
-    all_missions  = save_data["missions"]
-    is_new_board  = bool(prev_uuids)
-    if is_new_board:
-        missions = [m for m in all_missions if m.get("uuid") not in prev_uuids]
-        hidden   = len(all_missions) - len(missions)
-    else:
-        missions  = all_missions
-        hidden    = 0
-
-    # Override save_data missions for calc_results
-    filtered_save = {**save_data, "missions": missions}
+    filtered_save = save_data
 
     # ── Toggle ───────────────────────────────────────────────────────────────
     visited_var = tk.BooleanVar(value=True)
@@ -545,9 +513,6 @@ def build_ui(save_data: dict, graph: dict, planet_system: dict, inhabited: set[s
     def refresh():
         txt.config(state="normal")
         txt.delete("1.0", "end")
-
-        if hidden:
-            txt.insert("end", f"{hidden} job(s) already seen (hidden)\n\n", "dim")
 
         results = calc_results(filtered_save, graph, planet_system, inhabited, visited_var.get(), job_templates)
 
@@ -618,13 +583,7 @@ def main():
         print(f"    {m['name']} -> {m['destination']} (deadline {m['deadline']})")
     print(f"  Visited systems: {len(save_data['visited'])}")
 
-    snapshot    = load_snapshot()
-    current_key = f"{save_data['current_system']}::{save_data['current_planet']}"
-    prev_uuids  = set(snapshot.get(current_key, []))
-    print(f"  Known UUIDs at this location: {len(prev_uuids)}")
-    save_snapshot(save_data["missions"], save_data["current_system"], save_data["current_planet"])
-
-    build_ui(save_data, graph, planet_system, inhabited, prev_uuids, job_templates)
+    build_ui(save_data, graph, planet_system, inhabited, job_templates)
 
 
 if __name__ == "__main__":

@@ -47,18 +47,17 @@ FUEL_PER_JUMP = 100
 
 # ─── Snapshot (UUID diff) ────────────────────────────────────────────────────
 
-def load_snapshot() -> set[str]:
-    """Return set of job UUIDs from last run, or empty set."""
+def load_snapshot() -> dict:
+    """Return snapshot dict with location and UUIDs, or empty dict."""
     try:
-        data = json.loads(SNAPSHOT_FILE.read_text())
-        return set(data.get("uuids", []))
+        return json.loads(SNAPSHOT_FILE.read_text())
     except Exception:
-        return set()
+        return {}
 
-def save_snapshot(missions: list[dict]) -> None:
-    """Save current job UUIDs for diffing on next run."""
+def save_snapshot(missions: list[dict], system: str, planet: str | None) -> None:
+    """Save current location and job UUIDs for diffing on next run."""
     uuids = [m["uuid"] for m in missions if m.get("uuid")]
-    SNAPSHOT_FILE.write_text(json.dumps({"uuids": uuids}))
+    SNAPSHOT_FILE.write_text(json.dumps({"system": system, "planet": planet, "uuids": uuids}))
 
 # ─── Star-map parser ─────────────────────────────────────────────────────────
 
@@ -551,9 +550,12 @@ def main():
     print(f"  Timed missions: {len(save_data['missions'])}")
     print(f"  Visited systems: {len(save_data['visited'])}")
 
-    prev_uuids = load_snapshot()
-    print(f"  Previous snapshot: {len(prev_uuids)} UUIDs")
-    save_snapshot(save_data["missions"])
+    snapshot   = load_snapshot()
+    same_loc   = (snapshot.get("system") == save_data["current_system"] and
+                  snapshot.get("planet") == save_data["current_planet"])
+    prev_uuids = set() if same_loc else set(snapshot.get("uuids", []))
+    print(f"  Same location as last run: {same_loc} — {'showing all' if same_loc else 'diffing'}")
+    save_snapshot(save_data["missions"], save_data["current_system"], save_data["current_planet"])
 
     build_ui(save_data, graph, planet_system, inhabited, prev_uuids)
 

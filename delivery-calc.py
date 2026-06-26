@@ -1,602 +1,409 @@
 """
 Endless Sky Rush Delivery Calculator
-Reads the save file + star map, runs BFS with fuel state, shows go/no-go for timed missions.
+Reads delivery-calc.json (written by the patched game on landing) and
+map systems.txt, then shows go/no-go for every timed job/mission.
 """
 
-import argparse
-import glob
+import ctypes
+import ctypes.wintypes
+import json
 import os
 import re
+import socket
+import sys
+import threading
 import tkinter as tk
 from collections import deque
-from datetime import date, timedelta
-from pathlib import Path
+from datetime import date
 
-# ─── Defaults ───────────────────────────────────────────────────────────────
+# ── Single-instance: focus existing window via local socket ───────────────────
+_FOCUS_PORT = 54321
 
-def _find_save() -> str | None:
-    """Return the most recently modified save file, ignoring backups."""
-    saves_dir = Path(os.environ.get("APPDATA", "")) / "endless-sky" / "saves"
-    if not saves_dir.is_dir():
-        return None
-    candidates = [
-        p for p in saves_dir.glob("*.txt")
-        if "previous" not in p.name and "~~" not in p.name
-    ]
-    if not candidates:
-        return None
-    return str(max(candidates, key=lambda p: p.stat().st_mtime))
+def _try_focus_existing():
+    """If another instance is running, tell it to focus and return True."""
+    try:
+        s = socket.create_connection(("127.0.0.1", _FOCUS_PORT), timeout=0.5)
+        s.sendall(b"focus")
+        s.close()
+        return True
+    except OSError:
+        return False
 
-def _find_map() -> str | None:
-    """Return path to map systems.txt from the standard Steam install location."""
-    candidates = [
-        Path(r"C:\Program Files (x86)\Steam\steamapps\common\Endless Sky\data\map systems.txt"),
-        Path(r"C:\Program Files\Steam\steamapps\common\Endless Sky\data\map systems.txt"),
-        Path(os.environ.get("HOME", "")) / ".local/share/Steam/steamapps/common/Endless Sky/data/map systems.txt",
-    ]
-    for p in candidates:
-        if p.is_file():
-            return str(p)
-    return None
+def _start_focus_server(on_focus):
+    """Listen for focus requests from future instances."""
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", _FOCUS_PORT))
+    srv.listen(5)
+    srv.settimeout(1.0)
+    def _loop():
+        while True:
+            try:
+                conn, _ = srv.accept()
+                conn.recv(16)
+                conn.close()
+                on_focus()
+            except OSError:
+                pass
+    t = threading.Thread(target=_loop, daemon=True)
+    t.start()
 
-def _find_data_dir() -> str | None:
-    """Return path to the Endless Sky data directory."""
-    candidates = [
-        Path(r"C:\Program Files (x86)\Steam\steamapps\common\Endless Sky\data"),
-        Path(r"C:\Program Files\Steam\steamapps\common\Endless Sky\data"),
-        Path(os.environ.get("HOME", "")) / ".local/share/Steam/steamapps/common/Endless Sky/data",
-    ]
-    for p in candidates:
-        if p.is_dir():
-            return str(p)
-    return None
+# ── Paths ─────────────────────────────────────────────────────────────────────
+SIDECAR   = os.path.join(os.environ["APPDATA"], "endless-sky", "delivery-calc.json")
+SAVE_DIR  = os.path.join(os.environ["APPDATA"], "endless-sky", "saves")
+MAP_FILE  = r"C:\Program Files (x86)\Steam\steamapps\common\Endless Sky\data\map systems.txt"
 
-def parse_job_templates(data_dir: str) -> dict[str, tuple[int, int]]:
+
+# ── Parse star map ────────────────────────────────────────────────────────────
+def parse_map(path):
+    """Return (graph, planet_system) where:
+      graph         : dict[str, set[str]]  — bidirectional adjacency list
+      planet_system : dict[str, str]       — planet TrueName → system name
     """
-    Parse mission data files to build a map of template name → (min_dist, max_dist).
-    Only includes missions with both a deadline and a destination distance range.
-    """
-    templates: dict[str, tuple[int, int]] = {}
-    for filepath in glob.glob(f"{data_dir}/**/*.txt", recursive=True):
-        try:
-            text = open(filepath, encoding="utf-8").read()
-        except Exception:
-            continue
-        blocks = re.split(r"(?=^mission\s)", text, flags=re.MULTILINE)
-        for block in blocks:
-            m = re.match(r'^mission\s+"([^"]+)"', block)
-            if not m or "deadline" not in block:
-                continue
-            name = m.group(1)
-            dm = re.search(
-                r"^\tdestination\s*\n(?:[^\n]*\n)*?[^\n]*distance\s+(\d+)\s+(\d+)",
-                block, re.MULTILINE,
-            )
-            if dm:
-                templates[name] = (int(dm.group(1)), int(dm.group(2)))
-    return templates
-
-DEFAULT_SAVE     = _find_save()
-DEFAULT_MAP      = _find_map()
-DEFAULT_DATA_DIR = _find_data_dir()
-FUEL_PER_JUMP = 100
-
-# ─── Star-map parser ─────────────────────────────────────────────────────────
-
-def parse_map(map_path: str) -> tuple[dict[str, set[str]], dict[str, str]]:
-    """
-    Returns:
-        graph         — {system: {neighbour, ...}}  (bidirectional)
-        planet_system — {planet_name: system_name}
-    """
-    graph: dict[str, set[str]] = {}
-    planet_system: dict[str, str] = {}
-
+    graph = {}
+    planet_system = {}
     current_system = None
 
-    with open(map_path, encoding="utf-8") as f:
-        for raw in f:
-            line = raw.rstrip()
+    token_re = re.compile(r'"([^"]+)"|(\S+)')
 
-            # Top-level system declaration
-            if m := re.match(r'^system\s+"?([^"]+)"?\s*$', line):
-                current_system = m.group(1)
-                if current_system not in graph:
-                    graph[current_system] = set()
+    def first_token(line):
+        m = token_re.search(line)
+        return (m.group(1) or m.group(2)) if m else None
+
+    def all_tokens(line):
+        return [m.group(1) or m.group(2) for m in token_re.finditer(line)]
+
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for raw in f:
+            line = raw.rstrip("\n").rstrip("\r")
+            stripped = line.lstrip("\t")
+            depth = len(line) - len(stripped)
+
+            if depth == 0:
+                tokens = all_tokens(stripped)
+                if tokens and tokens[0] == "system" and len(tokens) >= 2:
+                    current_system = tokens[1]
+                    if current_system not in graph:
+                        graph[current_system] = set()
+                else:
+                    current_system = None
                 continue
 
             if current_system is None:
                 continue
 
-            # Hyperspace link
-            if m := re.match(r'^\tlink\s+"?([^"]+)"?\s*$', line):
-                neighbour = m.group(1)
-                graph[current_system].add(neighbour)
-                if neighbour not in graph:
-                    graph[neighbour] = set()
-                graph[neighbour].add(current_system)
+            tokens = all_tokens(stripped)
+            if not tokens:
                 continue
 
-            # Named object (planet/station) — name may be quoted or unquoted
-            if m := re.match(r'^\t+object\s+"([^"]+)"\s*$', line):
-                planet_system[m.group(1)] = current_system
-                continue
-            if m := re.match(r'^\t+object\s+([A-Za-z]\S*)\s*$', line):
-                planet_system[m.group(1)] = current_system
-                continue
+            key = tokens[0]
+
+            if key == "link" and len(tokens) >= 2:
+                dest = tokens[1]
+                graph[current_system].add(dest)
+                if dest not in graph:
+                    graph[dest] = set()
+                graph[dest].add(current_system)
+
+            elif key == "object" and len(tokens) >= 2:
+                planet_name = tokens[1]
+                planet_system[planet_name] = current_system
 
     return graph, planet_system
 
 
-# ─── Save-file parser ────────────────────────────────────────────────────────
-
-def parse_save(save_path: str) -> dict:
-    """
-    Returns a dict with:
-        current_date    — datetime.date
-        current_system  — str
-        drive           — "hyperdrive" | "jump drive"
-        fuel            — int  (current fuel units)
-        fuel_capacity   — int  (max fuel units)
-        missions        — list of {name, deadline: date, destination: str}
-        visited         — set[str]  (system names)
-    """
-    result = {
-        "current_date": None,
-        "current_system": None,
-        "current_planet": None,
-        "travel": None,
-        "drive": "hyperdrive",
-        "fuel": 100,
-        "fuel_capacity": 100,
-        "missions": [],
-        "visited": set(),
-    }
-
-    with open(save_path, encoding="utf-8") as f:
-        lines = f.readlines()
-
-    # ── Pass 1: header fields (date, system) and visited lines ───────────────
-    header_done = False
-    raw_date: date | None = None
-    system_entry_method: str | None = None
-
-    for raw in lines:
-        line = raw.rstrip()
-
-        if not header_done:
-            if m := re.match(r'^date\s+(\d+)\s+(\d+)\s+(\d+)', line):
-                d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
-                raw_date = date(y, mo, d)
+# ── BFS ───────────────────────────────────────────────────────────────────────
+def bfs(graph, start, visited_only=False, visited=None):
+    """Return dict[system_name -> hop_count] from start."""
+    if start not in graph:
+        return {}
+    dist = {start: 0}
+    q = deque([start])
+    while q:
+        node = q.popleft()
+        for nb in graph.get(node, ()):
+            if nb in dist:
                 continue
-            if m := re.match(r'^"system entry method"\s+"?([^"]+)"?\s*$', line):
-                system_entry_method = m.group(1)
+            if visited_only and visited and nb not in visited:
                 continue
-            if m := re.match(r'^system\s+"?([^"]+)"?\s*$', line):
-                result["current_system"] = m.group(1)
-                continue
-            if m := re.match(r'^planet\s+"?([^"]+)"?\s*$', line):
-                result["current_planet"] = m.group(1)
-                continue
-            if m := re.match(r'^travel\s+"?([^"]+)"?\s*$', line):
-                # Only record the first travel entry; multiple = autopilot route not mid-jump
-                if result["travel"] is None:
-                    result["travel"] = m.group(1)
-                continue
-            if re.match(r'^ship\s+', line):
-                header_done = True
-
-        if m := re.match(r'^visited\s+"?([^"]+)"?\s*$', line):
-            result["visited"].add(m.group(1))
-
-    # ES saves the departure date, not arrival — each jump costs 1 day.
-    # If "system entry method" is set, the player arrived via hyperspace and
-    # the save date is 1 day behind the actual current game date.
-    if raw_date is not None:
-        offset = 1 if system_entry_method is not None else 0
-        result["current_date"] = raw_date + timedelta(days=offset)
-
-    # ── Pass 2: flagship fuel, fuel_capacity, drive ──────────────────────────
-    flagship_found = False
-    in_attrs = False
-    in_outfits = False
-
-    for raw in lines:
-        line = raw.rstrip()
-        stripped = line.lstrip()
-        indent = len(line) - len(stripped)
-
-        if not flagship_found:
-            if re.match(r'^ship\s+', line):
-                flagship_found = True
-            continue
-
-        if re.match(r'^ship\s+', line):
-            break  # end of flagship block
-
-        if re.match(r'^\tattributes\s*$', line):
-            in_attrs = True
-            in_outfits = False
-            continue
-
-        if re.match(r'^\toutfits\s*$', line):
-            in_outfits = True
-            in_attrs = False
-            continue
-
-        # Leaving a sub-block back to 1-tab level
-        if indent == 1 and stripped:
-            in_attrs = False
-            in_outfits = False
-
-        if in_attrs:
-            if m := re.match(r'\t+"fuel capacity"\s+(\d+(?:\.\d+)?)', line):
-                result["fuel_capacity"] = int(float(m.group(1)))
-
-        if in_outfits:
-            if re.search(r'Jump Drive', stripped, re.IGNORECASE):
-                result["drive"] = "jump drive"
-
-        # Current fuel (1-tab level, not inside a sub-block)
-        if m := re.match(r'^\tfuel\s+(\d+(?:\.\d+)?)\s*$', line):
-            result["fuel"] = int(float(m.group(1)))
-
-    # ── Pass 3: timed mission blocks ─────────────────────────────────────────
-    in_mission = False
-    mission: dict = {}
-
-    for raw in lines:
-        line = raw.rstrip()
-        stripped = line.lstrip()
-        indent = len(line) - len(stripped)
-
-        if m := re.match(r'^"available job"\s+"([^"]+)"\s*$', line):
-            if in_mission and mission.get("deadline") and mission.get("destination"):
-                result["missions"].append(mission)
-            in_mission = True
-            mission = {"name": m.group(1), "template": m.group(1), "deadline": None, "destination": None, "uuid": None}
-            continue
-
-        if not in_mission:
-            continue
-
-        if indent == 0 and stripped:
-            if mission.get("deadline") and mission.get("destination"):
-                result["missions"].append(mission)
-            in_mission = False
-            mission = {}
-            continue
-
-        if m := re.match(r'^\tuuid\s+(\S+)\s*$', line):
-            mission["uuid"] = m.group(1)
-            continue
-
-        if m := re.match(r'^\tname\s+"?([^"]+)"?\s*$', line):
-            mission["name"] = m.group(1)
-            continue
-
-        if m := re.match(r'^\tdeadline\s+(\d+)\s+(\d+)\s+(\d+)', line):
-            d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
-            mission["deadline"] = date(y, mo, d)
-            continue
-
-        if m := re.match(r'^\tdestination\s+"?([^"]+)"?\s*$', line):
-            mission["destination"] = m.group(1)
-            continue
-
-    if in_mission and mission.get("deadline") and mission.get("destination"):
-        result["missions"].append(mission)
-
-    return result
+            dist[nb] = dist[node] + 1
+            q.append(nb)
+    return dist
 
 
-# ─── BFS with fuel state ─────────────────────────────────────────────────────
+# ── Date parsing ──────────────────────────────────────────────────────────────
+MONTH_MAP = {
+    "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4,
+    "May": 5, "Jun": 6, "Jul": 7, "Aug": 8,
+    "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
+}
 
-def shortest_hops(
-    graph: dict[str, set[str]],
-    start: str,
-    end: str,
-    fuel: int,
-    fuel_capacity: int,
-    inhabited: set[str],
-    visited_only: bool = False,
-    visited: set[str] | None = None,
-) -> int | None:
-    """
-    BFS from start to end tracking fuel state.
-    Refuels to full capacity instantly at any inhabited system (no time cost).
-    Returns hop count, or None if unreachable.
-    """
-    def refuel(system: str, current_fuel: int) -> int:
-        return fuel_capacity if system in inhabited else current_fuel
-
-    start_fuel = refuel(start, fuel)
-
-    if start == end:
-        return 0
-
-    allowed = visited if (visited_only and visited) else None
-
-    # State: (system, fuel_after_refuel_on_arrival)
-    queue: deque[tuple[str, int, int]] = deque([(start, start_fuel, 0)])
-    seen: set[tuple[str, int]] = {(start, start_fuel)}
-
-    while queue:
-        node, node_fuel, hops = queue.popleft()
-
-        for nbr in graph.get(node, ()):
-            if allowed is not None and nbr not in allowed:
-                continue
-
-            new_fuel = node_fuel - FUEL_PER_JUMP
-            if new_fuel < 0:
-                continue  # not enough fuel for this jump
-
-            new_fuel = refuel(nbr, new_fuel)
-
-            if nbr == end:
-                return hops + 1
-
-            state = (nbr, new_fuel)
-            if state not in seen:
-                seen.add(state)
-                queue.append((nbr, new_fuel, hops + 1))
-
-    return None
+def parse_es_date(s):
+    """'Sat, 17 Sep 3014' → datetime.date(3014, 9, 17)"""
+    # Strip weekday
+    s = s.strip()
+    if "," in s:
+        s = s.split(",", 1)[1].strip()
+    parts = s.split()
+    day   = int(parts[0])
+    month = MONTH_MAP[parts[1]]
+    year  = int(parts[2])
+    return date(year, month, day)
 
 
-# ─── Calculation core ─────────────────────────────────────────────────────────
+def days_between(d1, d2):
+    """d2 - d1 in days (positive means d2 is later)."""
+    return (d2 - d1).days
 
-def calc_results(
-    save_data: dict,
-    graph: dict[str, set[str]],
-    planet_system: dict[str, str],
-    inhabited: set[str],
-    visited_only: bool = False,
-    job_templates: dict[str, tuple[int, int]] | None = None,
-) -> list[dict]:
-    """
-    Returns list of result dicts:
-        name, destination, dest_system, hops, days, margin, status
-        status: "GO" | "TIGHT" | "NO-GO" | "UNKNOWN"
-    """
-    today        = save_data["current_date"]
-    current_sys  = save_data["current_system"]
-    visited      = save_data["visited"]
-    fuel         = save_data["fuel"]
-    fuel_cap     = save_data["fuel_capacity"]
-    results      = []
 
-    for m in save_data["missions"]:
-        dest_planet = m["destination"]
-        deadline    = m["deadline"]
-        dest_system = planet_system.get(dest_planet)
+# ── Load visited systems from save file ───────────────────────────────────────
+def load_visited():
+    visited = set()
+    try:
+        saves = [f for f in os.listdir(SAVE_DIR) if f.endswith(".txt")]
+        if not saves:
+            return visited
+        # Most recently modified save
+        newest = max(saves, key=lambda f: os.path.getmtime(os.path.join(SAVE_DIR, f)))
+        with open(os.path.join(SAVE_DIR, newest), encoding="utf-8", errors="replace") as f:
+            for line in f:
+                m = re.match(r'^visited\s+"?([^"\n]+)"?\s*$', line)
+                if m:
+                    visited.add(m.group(1).strip())
+    except Exception:
+        pass
+    return visited
 
-        if dest_system is None:
+
+# ── Main calculation ──────────────────────────────────────────────────────────
+def calculate(explored_only):
+    with open(SIDECAR, encoding="utf-8") as f:
+        data = json.load(f)
+
+    current_system = data["system"]
+    current_date   = parse_es_date(data["date"])
+    drive          = data["drive"]
+    jobs           = data["jobs"]
+
+    graph, planet_system = parse_map(MAP_FILE)
+    visited = load_visited() if explored_only else None
+
+    dist = bfs(graph, current_system, visited_only=explored_only, visited=visited)
+
+    results = []
+    for job in jobs:
+        dest_planet = job["planet"]
+        dest_system = job["system"]
+        deadline    = parse_es_date(job["deadline"])
+
+        days_left = days_between(current_date, deadline)
+
+        # Look up hop count
+        hops = dist.get(dest_system)
+        if hops is None:
             results.append({
-                "name": m["name"],
-                "destination": dest_planet,
-                "dest_system": "?",
-                "hops": None,
-                "days": (deadline - today).days,
-                "margin": None,
-                "status": "UNKNOWN",
+                "name":       job["name"],
+                "planet":     dest_planet,
+                "system":     dest_system,
+                "days_left":  days_left,
+                "hops":       None,
+                "margin":     None,
+                "status":     "unknown",
             })
             continue
 
-        # Use full graph for distance-filter (template range is game-world distance)
-        true_hops = shortest_hops(
-            graph, current_sys, dest_system,
-            fuel, fuel_cap, inhabited,
-            visited_only=False, visited=None,
-        )
-
-        # Filter: if destination distance is outside the template's valid range,
-        # this job was offered at a different planet — skip it.
-        if job_templates and true_hops is not None:
-            template = m.get("template", "")
-            if template in job_templates:
-                lo, hi = job_templates[template]
-                if not (lo <= true_hops <= hi):
-                    continue
-
-        hops = shortest_hops(
-            graph, current_sys, dest_system,
-            fuel, fuel_cap, inhabited,
-            visited_only, visited,
-        )
-        days = (deadline - today).days
-
-        if hops is None:
-            status = "UNKNOWN"
-            margin = None
+        # Each hop takes 1 day; need hops days of travel.
+        # Margin = days_left - hops (>=1 to make it with 0 spare)
+        margin = days_left - hops
+        if margin >= 2:
+            status = "go"
+        elif margin == 1:
+            status = "tight"
         else:
-            margin = days - hops
-            if margin < 0:
-                status = "NO-GO"
-            elif margin <= 1:
-                status = "TIGHT"
-            else:
-                status = "GO"
+            status = "nogo"
 
         results.append({
-            "name": m["name"],
-            "destination": dest_planet,
-            "dest_system": dest_system,
-            "hops": hops,
-            "days": days,
-            "margin": margin,
-            "status": status,
+            "name":      job["name"],
+            "planet":    dest_planet,
+            "system":    dest_system,
+            "days_left": days_left,
+            "hops":      hops,
+            "margin":    margin,
+            "status":    status,
         })
 
-    return results
+    # Sort: nogo first, then tight, then go; within each group by margin asc
+    order = {"nogo": 0, "tight": 1, "go": 2, "unknown": 3}
+    results.sort(key=lambda r: (order[r["status"]], r["margin"] if r["margin"] is not None else 999))
+
+    return data, results
 
 
-# ─── Tkinter UI ──────────────────────────────────────────────────────────────
-
-STATUS_COLORS = {
-    "GO":      "#2ecc71",
-    "TIGHT":   "#f39c12",
-    "NO-GO":   "#e74c3c",
-    "UNKNOWN": "#95a5a6",
+# ── GUI ───────────────────────────────────────────────────────────────────────
+COLOR = {
+    "go":      "#4caf50",
+    "tight":   "#ff9800",
+    "nogo":    "#f44336",
+    "unknown": "#9e9e9e",
+    "bg":      "#1e1e2e",
+    "fg":      "#cdd6f4",
+    "header":  "#89b4fa",
+    "card":    "#313244",
+    "sep":     "#45475a",
 }
 
-STATUS_SYMBOLS = {
-    "GO":      "✓ GO",
-    "TIGHT":   "⚠ TIGHT",
-    "NO-GO":   "✗ NO-GO",
-    "UNKNOWN": "? UNKNOWN",
-}
 
-
-def build_ui(save_data: dict, graph: dict, planet_system: dict, inhabited: set[str],
-             job_templates: dict | None = None) -> None:
+def build_ui():
     root = tk.Tk()
-    root.title("Endless Sky — Delivery Calculator")
-    root.configure(bg="#1e1e2e")
-    root.resizable(False, False)
-    root.attributes("-topmost", True)
+    root.title("Endless Sky — Delivery Calc")
+    root.configure(bg=COLOR["bg"])
+    root.resizable(True, True)
 
-    # ── Header ───────────────────────────────────────────────────────────────
-    hdr = tk.Frame(root, bg="#1e1e2e", pady=8)
-    hdr.pack(fill="x", padx=16)
+    explored_var = tk.BooleanVar(value=False)
+    last_mtime = [0.0]  # mutable cell for the watch loop
 
-    date_str    = save_data["current_date"].strftime("%d %b %Y") if save_data["current_date"] else "?"
-    sys_str     = save_data["current_system"] or "?"
-    planet      = save_data["current_planet"]
-    travel      = save_data["travel"]
-    in_transit  = travel is not None and planet is None
-    drive_str   = save_data["drive"].title()
-    fuel        = save_data["fuel"]
-    fuel_cap    = save_data["fuel_capacity"]
-    jumps_now   = fuel // FUEL_PER_JUMP
-    jumps_max   = fuel_cap // FUEL_PER_JUMP
+    # ── Header ────────────────────────────────────────────────────────────────
+    header_frame = tk.Frame(root, bg=COLOR["bg"])
+    header_frame.pack(fill="x", padx=12, pady=(10, 4))
 
-    location_str = f"System: {sys_str}" + (f"   Planet: {planet}" if planet else "")
-    tk.Label(hdr, text=f"Date: {date_str}   {location_str}   Drive: {drive_str}",
-             font=("Courier", 11), fg="#cdd6f4", bg="#1e1e2e").pack(anchor="w")
-    if in_transit:
-        tk.Label(hdr, text=f"In transit → {travel}",
-                 font=("Courier", 10), fg="#f39c12", bg="#1e1e2e").pack(anchor="w")
-    tk.Label(hdr, text=f"Fuel: {fuel}/{fuel_cap}  ({jumps_now} jumps now, {jumps_max} max)",
-             font=("Courier", 10), fg="#a6adc8", bg="#1e1e2e").pack(anchor="w")
+    info_label = tk.Label(header_frame, bg=COLOR["bg"], fg=COLOR["header"],
+                          font=("Consolas", 10), anchor="w", justify="left")
+    info_label.pack(side="left", fill="x", expand=True)
 
-    filtered_save = save_data
+    chk = tk.Checkbutton(header_frame, text="Explored systems only",
+                         variable=explored_var, bg=COLOR["bg"], fg=COLOR["fg"],
+                         selectcolor=COLOR["card"], activebackground=COLOR["bg"],
+                         activeforeground=COLOR["fg"], font=("Consolas", 9),
+                         command=lambda: refresh())
+    chk.pack(side="right")
 
-    # ── Toggle ───────────────────────────────────────────────────────────────
-    visited_var = tk.BooleanVar(value=True)
-    toggle_frame = tk.Frame(root, bg="#1e1e2e")
-    toggle_frame.pack(fill="x", padx=16, pady=(0, 6))
-    tk.Checkbutton(
-        toggle_frame,
-        text="Explored systems only",
-        variable=visited_var,
-        font=("Courier", 10),
-        fg="#cdd6f4", bg="#1e1e2e",
-        selectcolor="#313244",
-        activeforeground="#cdd6f4", activebackground="#1e1e2e",
-        command=lambda: refresh(),
-    ).pack(anchor="w")
+    # ── Scrollable results area ───────────────────────────────────────────────
+    canvas = tk.Canvas(root, bg=COLOR["bg"], highlightthickness=0)
+    scrollbar = tk.Scrollbar(root, orient="vertical", command=canvas.yview)
+    canvas.configure(yscrollcommand=scrollbar.set)
 
-    # ── Results area (selectable Text widget) ────────────────────────────────
-    txt = tk.Text(root, bg="#1e1e2e", fg="#cdd6f4", font=("Courier", 10),
-                  relief="flat", bd=0, wrap="none", cursor="arrow",
-                  width=62, height=16)
-    txt.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+    scrollbar.pack(side="right", fill="y")
+    canvas.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=(0, 8))
 
-    txt.tag_configure("dim",   foreground="#6c7086")
-    txt.tag_configure("muted", foreground="#a6adc8")
-    txt.tag_configure("bold",  font=("Courier", 11, "bold"))
-    for status, color in STATUS_COLORS.items():
-        txt.tag_configure(status, foreground=color, font=("Courier", 10, "bold"))
+    scroll_frame = tk.Frame(canvas, bg=COLOR["bg"])
+    canvas_window = canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
+
+    def on_configure(event):
+        canvas.configure(scrollregion=canvas.bbox("all"))
+        canvas.itemconfig(canvas_window, width=canvas.winfo_width())
+
+    scroll_frame.bind("<Configure>", on_configure)
+    canvas.bind("<Configure>", lambda e: canvas.itemconfig(canvas_window, width=e.width))
+    canvas.bind_all("<MouseWheel>", lambda e: canvas.yview_scroll(-1 * (e.delta // 120), "units"))
+
+    def clear_results():
+        for w in scroll_frame.winfo_children():
+            w.destroy()
 
     def refresh():
-        txt.config(state="normal")
-        txt.delete("1.0", "end")
+        clear_results()
+        try:
+            last_mtime[0] = os.path.getmtime(SIDECAR)
+            data, results = calculate(explored_var.get())
+        except FileNotFoundError:
+            info_label.config(text="delivery-calc.json not found — land at a planet first.")
+            return
+        except Exception as e:
+            info_label.config(text=f"Error: {e}")
+            return
 
-        results = calc_results(filtered_save, graph, planet_system, inhabited, visited_var.get(), job_templates)
+        info_label.config(
+            text=f"{data['date']}  ·  {data['system']}  ·  {data['drive']}"
+        )
 
         if not results:
-            txt.insert("end", "No new timed missions at this location.", "dim")
-        else:
-            for r in results:
-                symbol = STATUS_SYMBOLS[r["status"]]
-                txt.insert("end", r["name"] + "\n", "bold")
-                txt.insert("end", f"→ {r['destination']} ({r['dest_system']})\n", "muted")
-                if r["status"] == "UNKNOWN":
-                    stats = "Route unknown (unexplored)" if visited_var.get() else "Destination not found"
-                else:
-                    margin_str = f"+{r['margin']}" if r["margin"] >= 0 else str(r["margin"])
-                    stats = f"Hops: {r['hops']}  |  Days: {r['days']}  |  Margin: {margin_str}"
-                txt.insert("end", stats + "  ", "muted")
-                txt.insert("end", symbol + "\n\n", r["status"])
+            tk.Label(scroll_frame, text="No timed jobs available.",
+                     bg=COLOR["bg"], fg=COLOR["fg"],
+                     font=("Consolas", 10)).pack(pady=20)
+            return
 
-        txt.config(state="disabled")
+        for r in results:
+            color = COLOR[r["status"]]
+            card = tk.Frame(scroll_frame, bg=COLOR["card"], pady=6, padx=10)
+            card.pack(fill="x", padx=4, pady=3)
+
+            # Status badge + name
+            top = tk.Frame(card, bg=COLOR["card"])
+            top.pack(fill="x")
+
+            badge_text = {"go": "✓ GO", "tight": "~ TIGHT", "nogo": "✗ NO-GO", "unknown": "? UNKNOWN"}[r["status"]]
+            tk.Label(top, text=badge_text, bg=color, fg="white",
+                     font=("Consolas", 9, "bold"), padx=6, pady=1).pack(side="left")
+
+            tk.Label(top, text="  " + r["name"], bg=COLOR["card"], fg=COLOR["fg"],
+                     font=("Consolas", 10), anchor="w").pack(side="left", fill="x", expand=True)
+
+            # Detail line
+            if r["hops"] is not None:
+                detail = f"{r['planet']} ({r['system']})   Hops: {r['hops']}  Days left: {r['days_left']}  Margin: {r['margin']:+d}"
+            else:
+                route_note = "(no explored route)" if explored_var.get() else "(unreachable?)"
+                detail = f"{r['planet']} ({r['system']})   Days left: {r['days_left']}  {route_note}"
+
+            tk.Label(card, text=detail, bg=COLOR["card"], fg=COLOR["sep"] if r["status"] == "unknown" else COLOR["fg"],
+                     font=("Consolas", 9), anchor="w").pack(fill="x")
+
+    # ── Buttons ───────────────────────────────────────────────────────────────
+    btn_frame = tk.Frame(root, bg=COLOR["bg"])
+    btn_frame.pack(fill="x", padx=12, pady=(0, 8))
+
+    tk.Button(btn_frame, text="Refresh", command=refresh,
+              bg=COLOR["card"], fg=COLOR["fg"], relief="flat",
+              font=("Consolas", 9), padx=8).pack(side="left")
+    tk.Button(btn_frame, text="Close", command=root.destroy,
+              bg=COLOR["card"], fg=COLOR["fg"], relief="flat",
+              font=("Consolas", 9), padx=8).pack(side="right")
+
+    def watch():
+        try:
+            mtime = os.path.getmtime(SIDECAR)
+            if mtime != last_mtime[0]:
+                refresh()
+        except FileNotFoundError:
+            pass
+        root.after(1000, watch)
+
+    def focus_window():
+        def _do():
+            root.deiconify()
+            root.attributes("-topmost", True)
+            root.lift()
+            root.focus_force()
+            root.after(200, lambda: root.attributes("-topmost", False))
+        root.after(0, _do)
+
+    _start_focus_server(focus_window)
+
+    # Register Ctrl+Alt+Z in a dedicated thread with its own Win32 message loop.
+    # Tkinter's main loop would eat WM_HOTKEY before a PeekMessage poll could see it,
+    # so we let a background thread own the registration and GetMessage loop instead.
+    def _hotkey_thread():
+        user32 = ctypes.windll.user32
+        user32.RegisterHotKey(None, 1, 0x0002 | 0x0001, 0x5A)  # CTRL+ALT+Z
+        msg = ctypes.wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
+            if msg.message == 0x0312:  # WM_HOTKEY
+                focus_window()
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+
+    threading.Thread(target=_hotkey_thread, daemon=True).start()
 
     refresh()
-
-    # ── Close button ─────────────────────────────────────────────────────────
-    tk.Button(root, text="Close", command=root.destroy,
-              font=("Courier", 10), fg="#cdd6f4", bg="#45475a",
-              activeforeground="#cdd6f4", activebackground="#585b70",
-              relief="flat", padx=12, pady=4).pack(pady=(0, 10))
-
+    root.after(1000, watch)
+    root.minsize(520, 200)
     root.mainloop()
 
 
-# ─── Entry point ─────────────────────────────────────────────────────────────
-
-def main():
-    parser = argparse.ArgumentParser(description="Endless Sky delivery deadline calculator")
-    parser.add_argument("--save", default=DEFAULT_SAVE,     help="Path to save file")
-    parser.add_argument("--map",  default=DEFAULT_MAP,      help="Path to map systems.txt")
-    parser.add_argument("--data", default=DEFAULT_DATA_DIR, help="Path to Endless Sky data directory")
-    args = parser.parse_args()
-
-    if not args.map:
-        parser.error("Could not find map systems.txt. Use --map to specify its path.")
-    if not args.save:
-        parser.error("Could not find a save file. Use --save to specify its path.")
-
-    job_templates: dict[str, tuple[int, int]] = {}
-    if args.data:
-        print("Parsing job templates…")
-        job_templates = parse_job_templates(args.data)
-        print(f"  {len(job_templates)} timed mission templates loaded")
-
-    print("Parsing star map…")
-    graph, planet_system = parse_map(args.map)
-    inhabited = set(planet_system.values())
-    print(f"  {len(graph)} systems, {len(planet_system)} named planets, {len(inhabited)} inhabited systems")
-
-    print("Parsing save file…")
-    save_data = parse_save(args.save)
-    fuel     = save_data["fuel"]
-    fuel_cap = save_data["fuel_capacity"]
-    print(f"  Date: {save_data['current_date']}")
-    print(f"  System: {save_data['current_system']}")
-    print(f"  Planet: {save_data['current_planet']}")
-    print(f"  Drive: {save_data['drive']}")
-    print(f"  Fuel: {fuel}/{fuel_cap} ({fuel // FUEL_PER_JUMP} jumps now, {fuel_cap // FUEL_PER_JUMP} max)")
-    print(f"  Timed missions: {len(save_data['missions'])}")
-    for m in save_data["missions"]:
-        print(f"    {m['name']} -> {m['destination']} (deadline {m['deadline']})")
-    print(f"  Visited systems: {len(save_data['visited'])}")
-
-    build_ui(save_data, graph, planet_system, inhabited, job_templates)
-
-
 if __name__ == "__main__":
-    import traceback, tempfile
-    try:
-        main()
-    except Exception:
-        log = Path(tempfile.gettempdir()) / "delivery-calc-error.txt"
-        log.write_text(traceback.format_exc())
-        # Also show a tkinter error dialog if possible
-        try:
-            import tkinter.messagebox as mb
-            root = tk.Tk(); root.withdraw()
-            mb.showerror("delivery-calc crashed", f"Error log: {log}\n\n{traceback.format_exc()}")
-        except Exception:
-            pass
+    if "--sidecar" in sys.argv:
+        idx = sys.argv.index("--sidecar")
+        SIDECAR = sys.argv[idx + 1]
+    if _try_focus_existing():
+        sys.exit(0)  # existing window focused, nothing more to do
+    build_ui()

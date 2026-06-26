@@ -9,7 +9,7 @@ import os
 import re
 import tkinter as tk
 from collections import deque
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 # ─── Defaults ───────────────────────────────────────────────────────────────
@@ -140,13 +140,19 @@ def parse_save(save_path: str) -> dict:
 
     # ── Pass 1: header fields (date, system) and visited lines ───────────────
     header_done = False
+    raw_date: date | None = None
+    system_entry_method: str | None = None
+
     for raw in lines:
         line = raw.rstrip()
 
         if not header_done:
             if m := re.match(r'^date\s+(\d+)\s+(\d+)\s+(\d+)', line):
                 d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
-                result["current_date"] = date(y, mo, d)
+                raw_date = date(y, mo, d)
+                continue
+            if m := re.match(r'^"system entry method"\s+"?([^"]+)"?\s*$', line):
+                system_entry_method = m.group(1)
                 continue
             if m := re.match(r'^system\s+"?([^"]+)"?\s*$', line):
                 result["current_system"] = m.group(1)
@@ -161,6 +167,13 @@ def parse_save(save_path: str) -> dict:
                 continue
             if re.match(r'^ship\s+', line):
                 header_done = True
+
+    # ES saves the departure date, not arrival — each jump costs 1 day.
+    # If "system entry method" is set, the player arrived via hyperspace and
+    # the save date is 1 day behind the actual current game date.
+    if raw_date is not None:
+        offset = 1 if system_entry_method is not None else 0
+        result["current_date"] = raw_date + timedelta(days=offset)
 
         if m := re.match(r'^visited\s+"?([^"]+)"?\s*$', line):
             result["visited"].add(m.group(1))
@@ -461,57 +474,43 @@ def build_ui(save_data: dict, graph: dict, planet_system: dict, inhabited: set[s
         command=lambda: refresh(),
     ).pack(anchor="w")
 
-    # ── Results area ─────────────────────────────────────────────────────────
-    results_frame = tk.Frame(root, bg="#1e1e2e")
-    results_frame.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+    # ── Results area (selectable Text widget) ────────────────────────────────
+    txt = tk.Text(root, bg="#1e1e2e", fg="#cdd6f4", font=("Courier", 10),
+                  relief="flat", bd=0, wrap="none", cursor="arrow",
+                  width=62, height=16)
+    txt.pack(fill="both", expand=True, padx=16, pady=(0, 8))
 
-    if hidden:
-        tk.Label(results_frame,
-                 text=f"{hidden} job(s) from previous landings hidden",
-                 font=("Courier", 9), fg="#6c7086", bg="#1e1e2e").pack(anchor="w", pady=(0, 4))
+    txt.tag_configure("dim",   foreground="#6c7086")
+    txt.tag_configure("muted", foreground="#a6adc8")
+    txt.tag_configure("bold",  font=("Courier", 11, "bold"))
+    for status, color in STATUS_COLORS.items():
+        txt.tag_configure(status, foreground=color, font=("Courier", 10, "bold"))
 
     def refresh():
-        for widget in results_frame.winfo_children():
-            widget.destroy()
+        txt.config(state="normal")
+        txt.delete("1.0", "end")
 
         if hidden:
-            tk.Label(results_frame,
-                     text=f"{hidden} job(s) from previous landings hidden",
-                     font=("Courier", 9), fg="#6c7086", bg="#1e1e2e").pack(anchor="w", pady=(0, 4))
+            txt.insert("end", f"{hidden} job(s) from previous landings hidden\n\n", "dim")
 
         results = calc_results(filtered_save, graph, planet_system, inhabited, visited_var.get())
 
         if not results:
-            tk.Label(results_frame, text="No new timed missions at this location.",
-                     font=("Courier", 11), fg="#6c7086", bg="#1e1e2e").pack(pady=8)
-            return
+            txt.insert("end", "No new timed missions at this location.", "dim")
+        else:
+            for r in results:
+                symbol = STATUS_SYMBOLS[r["status"]]
+                txt.insert("end", r["name"] + "\n", "bold")
+                txt.insert("end", f"→ {r['destination']} ({r['dest_system']})\n", "muted")
+                if r["status"] == "UNKNOWN":
+                    stats = "Route unknown (unexplored)" if visited_var.get() else "Destination not found"
+                else:
+                    margin_str = f"+{r['margin']}" if r["margin"] >= 0 else str(r["margin"])
+                    stats = f"Hops: {r['hops']}  |  Days: {r['days']}  |  Margin: {margin_str}"
+                txt.insert("end", stats + "  ", "muted")
+                txt.insert("end", symbol + "\n\n", r["status"])
 
-        for r in results:
-            color  = STATUS_COLORS[r["status"]]
-            symbol = STATUS_SYMBOLS[r["status"]]
-
-            card = tk.Frame(results_frame, bg="#313244", pady=6, padx=10)
-            card.pack(fill="x", pady=4)
-
-            tk.Label(card, text=r["name"],
-                     font=("Courier", 11, "bold"),
-                     fg="#cdd6f4", bg="#313244").pack(anchor="w")
-
-            tk.Label(card, text=f"→ {r['destination']} ({r['dest_system']})",
-                     font=("Courier", 10), fg="#a6adc8", bg="#313244").pack(anchor="w")
-
-            if r["status"] == "UNKNOWN":
-                stats = "Route unknown (unexplored)" if visited_var.get() else "Destination not found in star map"
-            else:
-                margin_str = f"+{r['margin']}" if r["margin"] >= 0 else str(r["margin"])
-                stats = f"Hops: {r['hops']}  |  Days: {r['days']}  |  Margin: {margin_str}"
-
-            stats_frame = tk.Frame(card, bg="#313244")
-            stats_frame.pack(fill="x", pady=(2, 0))
-            tk.Label(stats_frame, text=stats,
-                     font=("Courier", 10), fg="#a6adc8", bg="#313244").pack(side="left")
-            tk.Label(stats_frame, text=f"  {symbol}",
-                     font=("Courier", 10, "bold"), fg=color, bg="#313244").pack(side="left")
+        txt.config(state="disabled")
 
     refresh()
 

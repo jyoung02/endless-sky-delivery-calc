@@ -55,12 +55,12 @@ def load_snapshot() -> dict:
         return {}
 
 def save_snapshot(missions: list[dict], system: str, planet: str | None) -> None:
-    """Save per-location UUID history and last-run location."""
+    """Add current job UUIDs to the seen-set for this location (never clears old ones)."""
     snapshot = load_snapshot()
     key = f"{system}::{planet}"
-    uuids = [m["uuid"] for m in missions if m.get("uuid")]
-    snapshot[key] = uuids
-    snapshot["_last"] = key
+    existing = set(snapshot.get(key, []))
+    current  = {m["uuid"] for m in missions if m.get("uuid")}
+    snapshot[key] = list(existing | current)
     SNAPSHOT_FILE.write_text(json.dumps(snapshot))
 
 # ─── Star-map parser ─────────────────────────────────────────────────────────
@@ -491,7 +491,7 @@ def build_ui(save_data: dict, graph: dict, planet_system: dict, inhabited: set[s
         txt.delete("1.0", "end")
 
         if hidden:
-            txt.insert("end", f"{hidden} job(s) from previous landings hidden\n\n", "dim")
+            txt.insert("end", f"{hidden} job(s) already seen (hidden)\n\n", "dim")
 
         results = calc_results(filtered_save, graph, planet_system, inhabited, visited_var.get())
 
@@ -555,13 +555,8 @@ def main():
 
     snapshot    = load_snapshot()
     current_key = f"{save_data['current_system']}::{save_data['current_planet']}"
-    last_key    = snapshot.get("_last")
-    same_loc    = (last_key == current_key)
-    if same_loc:
-        prev_uuids = set()          # re-run at same spot → show everything
-    else:
-        prev_uuids = set(snapshot.get(current_key, []))  # diff vs last visit HERE
-    print(f"  Last run: {last_key or 'none'}  Now: {current_key}  same={same_loc}")
+    prev_uuids  = set(snapshot.get(current_key, []))
+    print(f"  Known UUIDs at this location: {len(prev_uuids)}")
     save_snapshot(save_data["missions"], save_data["current_system"], save_data["current_planet"])
 
     build_ui(save_data, graph, planet_system, inhabited, prev_uuids)
